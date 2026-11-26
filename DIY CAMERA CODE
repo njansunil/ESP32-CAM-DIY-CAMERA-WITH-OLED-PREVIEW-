@@ -1,0 +1,728 @@
+/*
+  ==========================================
+             LUMINO CLICKS
+          ESP32-CAM DIGITAL CAMERA
+  ==========================================
+
+  FEATURES:
+  - 3-second animated boot screen
+  - SSD1306 128x64 live preview
+  - Floyd-Steinberg monochrome dithering
+  - Correct upright camera orientation
+  - One-button photo capture
+  - High-resolution 1600x1200 JPEG photos
+  - Original JPEG saved to microSD
+  - Automatic sequential filenames
+  - Automatic return to live preview
+
+  BOARD: AI Thinker ESP32-CAM
+  CAMERA: OV2640
+  OLED: SSD1306 128x64 I2C
+  SD: 1-bit mode
+  PSRAM: REQUIRED
+
+  OLED:
+  SDA = GPIO 1
+  SCL = GPIO 3
+
+  BUTTON:
+  GPIO 13 to GND
+*/
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <TJpg_Decoder.h>
+
+#include "esp_camera.h"
+#include "FS.h"
+#include "SD_MMC.h"
+
+// ==========================================
+// OLED CONFIGURATION
+// ==========================================
+
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+#define OLED_SDA 1
+#define OLED_SCL 3
+
+Adafruit_SSD1306 display(
+  OLED_WIDTH,
+  OLED_HEIGHT,
+  &Wire,
+  -1
+);
+
+// ==========================================
+// BUTTON
+// ==========================================
+
+#define BUTTON_PIN 13
+
+// ==========================================
+// CAMERA PIN CONFIGURATION
+// AI THINKER ESP32-CAM
+// ==========================================
+
+#define CAM_PWDN 32
+#define CAM_RESET -1
+#define CAM_XCLK 0
+
+#define CAM_SIOD 26
+#define CAM_SIOC 27
+
+#define CAM_Y9 35
+#define CAM_Y8 34
+#define CAM_Y7 39
+#define CAM_Y6 36
+#define CAM_Y5 21
+#define CAM_Y4 19
+#define CAM_Y3 18
+#define CAM_Y2 5
+
+#define CAM_VSYNC 25
+#define CAM_HREF 23
+#define CAM_PCLK 22
+
+// ==========================================
+// RESOLUTION CONFIGURATION
+// ==========================================
+
+#define PREVIEW_WIDTH 160
+#define PREVIEW_HEIGHT 120
+
+#define PHOTO_QUALITY 10
+#define PREVIEW_QUALITY 12
+
+// ==========================================
+// IMAGE BUFFER
+// ==========================================
+
+uint16_t rgbFrame[
+  PREVIEW_WIDTH * PREVIEW_HEIGHT
+];
+
+int16_t errorA[OLED_WIDTH + 2];
+int16_t errorB[OLED_WIDTH + 2];
+
+// ==========================================
+// SYSTEM VARIABLES
+// ==========================================
+
+bool cameraReady = false;
+bool sdReady = false;
+
+uint32_t photoNumber = 1;
+
+// ==========================================
+// JPEG DECODER CALLBACK
+// ==========================================
+
+bool jpegRender(
+  int16_t x,
+  int16_t y,
+  uint16_t w,
+  uint16_t h,
+  uint16_t *bitmap
+) {
+
+  for (uint16_t row = 0; row < h; row++) {
+
+    for (uint16_t col = 0; col < w; col++) {
+
+      int px = x + col;
+      int py = y + row;
+
+      if (
+        px >= 0 &&
+        py >= 0 &&
+        px < PREVIEW_WIDTH &&
+        py < PREVIEW_HEIGHT
+      ) {
+
+        rgbFrame[
+          py * PREVIEW_WIDTH + px
+        ] = bitmap[row * w + col];
+
+      }
+    }
+  }
+
+  return true;
+}
+
+// ==========================================
+// BOOT ANIMATION
+// ==========================================
+
+void bootAnimation() {
+
+  for (int frame = 0; frame < 30; frame++) {
+
+    display.clearDisplay();
+
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(29, 8);
+    display.println("LUMINO CLICKS");
+
+    display.setCursor(31, 22);
+    display.println("BOOTING DEVICE");
+
+    int completed = (frame * 8) / 30;
+
+    for (int i = 0; i < 8; i++) {
+
+      int x = 16 + i * 13;
+      int y = 43;
+
+      if (i < completed) {
+
+        display.fillRect(
+          x, y, 9, 9,
+          SSD1306_WHITE
+        );
+
+      } else {
+
+        display.drawRect(
+          x, y, 9, 9,
+          SSD1306_WHITE
+        );
+
+      }
+    }
+
+    display.display();
+
+    delay(100);
+  }
+}
+
+// ==========================================
+// CAMERA INITIALIZATION
+// ==========================================
+
+bool initCamera() {
+
+  camera_config_t config = {};
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = CAM_Y2;
+  config.pin_d1 = CAM_Y3;
+  config.pin_d2 = CAM_Y4;
+  config.pin_d3 = CAM_Y5;
+  config.pin_d4 = CAM_Y6;
+  config.pin_d5 = CAM_Y7;
+  config.pin_d6 = CAM_Y8;
+  config.pin_d7 = CAM_Y9;
+
+  config.pin_xclk = CAM_XCLK;
+  config.pin_pclk = CAM_PCLK;
+
+  config.pin_vsync = CAM_VSYNC;
+  config.pin_href = CAM_HREF;
+
+  config.pin_sccb_sda = CAM_SIOD;
+  config.pin_sccb_scl = CAM_SIOC;
+
+  config.pin_pwdn = CAM_PWDN;
+  config.pin_reset = CAM_RESET;
+
+  config.xclk_freq_hz = 20000000;
+
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Initialize at UXGA
+
+  config.frame_size = FRAMESIZE_UXGA;
+
+  config.jpeg_quality = PREVIEW_QUALITY;
+
+  config.fb_count = 1;
+
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+
+  esp_err_t result = esp_camera_init(&config);
+
+  if (result != ESP_OK) {
+
+    Serial.printf(
+      "Camera initialization failed: 0x%x\n",
+      result
+    );
+
+    return false;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (!sensor) return false;
+
+  // ========================================
+  // CAMERA ORIENTATION FIX
+  // ========================================
+
+  // Horizontal mirror OFF
+  sensor->set_hmirror(sensor, 0);
+
+  // Vertical flip OFF
+  sensor->set_vflip(sensor, 0);
+
+  // ========================================
+  // START IN LOW-RESOLUTION PREVIEW MODE
+  // ========================================
+
+  sensor->set_framesize(
+    sensor,
+    FRAMESIZE_QQVGA
+  );
+
+  sensor->set_quality(
+    sensor,
+    PREVIEW_QUALITY
+  );
+
+  delay(200);
+
+  Serial.println("Camera orientation: NORMAL");
+
+  return true;
+}
+
+// ==========================================
+// SD CARD INITIALIZATION
+// ==========================================
+
+bool initSD() {
+
+  if (!SD_MMC.begin("/sdcard", true)) {
+
+    Serial.println("SD initialization failed");
+
+    return false;
+  }
+
+  if (SD_MMC.cardType() == CARD_NONE) {
+
+    Serial.println("No SD card detected");
+
+    return false;
+  }
+
+  Serial.println("SD card ready");
+
+  return true;
+}
+
+// ==========================================
+// RGB565 TO GRAYSCALE
+// ==========================================
+
+uint8_t getGray(uint16_t color) {
+
+  uint8_t r = (color >> 11) & 0x1F;
+  uint8_t g = (color >> 5) & 0x3F;
+  uint8_t b = color & 0x1F;
+
+  r = (r * 255) / 31;
+  g = (g * 255) / 63;
+  b = (b * 255) / 31;
+
+  return (
+    77 * r +
+    150 * g +
+    29 * b
+  ) >> 8;
+}
+
+// ==========================================
+// FLOYD-STEINBERG DITHERING
+// ==========================================
+
+void renderDither() {
+
+  memset(errorA, 0, sizeof(errorA));
+  memset(errorB, 0, sizeof(errorB));
+
+  int16_t *current = errorA;
+  int16_t *next = errorB;
+
+  uint8_t *buffer = display.getBuffer();
+
+  memset(buffer, 0, 1024);
+
+  for (int y = 0; y < OLED_HEIGHT; y++) {
+
+    int sourceY = 20 + (y * 80) / 64;
+
+    for (int x = 0; x < OLED_WIDTH; x++) {
+
+      int sourceX =
+        (x * PREVIEW_WIDTH) / OLED_WIDTH;
+
+      uint16_t color =
+        rgbFrame[
+          sourceY * PREVIEW_WIDTH + sourceX
+        ];
+
+      int oldPixel = getGray(color);
+
+      oldPixel += current[x + 1] / 16;
+
+      oldPixel = constrain(
+        oldPixel, 0, 255
+      );
+
+      int newPixel =
+        (oldPixel >= 128) ? 255 : 0;
+
+      int quantError =
+        oldPixel - newPixel;
+
+      current[x + 2] += quantError * 7;
+
+      next[x] += quantError * 3;
+
+      next[x + 1] += quantError * 5;
+
+      next[x + 2] += quantError;
+
+      if (newPixel == 255) {
+
+        buffer[
+          x + (y / 8) * OLED_WIDTH
+        ] |= (1 << (y & 7));
+
+      }
+    }
+
+    int16_t *temp = current;
+
+    current = next;
+    next = temp;
+
+    memset(next, 0, sizeof(errorA));
+  }
+
+  display.display();
+}
+
+// ==========================================
+// LIVE CAMERA PREVIEW
+// ==========================================
+
+void updatePreview() {
+
+  if (!cameraReady) return;
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) return;
+
+  if (fb->format == PIXFORMAT_JPEG) {
+
+    TJpgDec.drawJpg(
+      0,
+      0,
+      fb->buf,
+      fb->len
+    );
+
+    renderDither();
+  }
+
+  esp_camera_fb_return(fb);
+}
+
+// ==========================================
+// HIGH-RESOLUTION PHOTO CAPTURE
+// ==========================================
+
+void takePhoto() {
+
+  if (!cameraReady || !sdReady) {
+
+    Serial.println("Camera or SD not ready");
+
+    return;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  if (!sensor) return;
+
+  Serial.println("Preparing high-resolution capture...");
+
+  // Set photo quality
+
+  sensor->set_quality(
+    sensor,
+    PHOTO_QUALITY
+  );
+
+  // Switch to UXGA 1600x1200
+
+  int result = sensor->set_framesize(
+    sensor,
+    FRAMESIZE_UXGA
+  );
+
+  if (result != 0) {
+
+    Serial.println("Failed to switch to UXGA");
+
+    sensor->set_quality(sensor, PREVIEW_QUALITY);
+
+    sensor->set_framesize(sensor, FRAMESIZE_QQVGA);
+
+    return;
+  }
+
+  delay(300);
+
+  // Discard first frame
+
+  camera_fb_t *discard = esp_camera_fb_get();
+
+  if (discard) {
+
+    esp_camera_fb_return(discard);
+
+  }
+
+  // Capture actual photo
+
+  camera_fb_t *fb = esp_camera_fb_get();
+
+  if (!fb) {
+
+    Serial.println("Photo capture failed");
+
+    sensor->set_quality(sensor, PREVIEW_QUALITY);
+
+    sensor->set_framesize(sensor, FRAMESIZE_QQVGA);
+
+    return;
+  }
+
+  Serial.printf(
+    "Captured: %u x %u\n",
+    fb->width,
+    fb->height
+  );
+
+  // Generate sequential filename
+
+  char filename[32];
+
+  do {
+
+    snprintf(
+      filename,
+      sizeof(filename),
+      "/PHOTO_%04lu.JPG",
+      (unsigned long)photoNumber
+    );
+
+    if (SD_MMC.exists(filename)) {
+
+      photoNumber++;
+
+    } else {
+
+      break;
+
+    }
+
+  } while (true);
+
+  // Save original JPEG
+
+  File file = SD_MMC.open(
+    filename,
+    FILE_WRITE
+  );
+
+  if (file) {
+
+    size_t written = file.write(
+      fb->buf,
+      fb->len
+    );
+
+    file.close();
+
+    if (written == fb->len) {
+
+      Serial.println("PHOTO SAVED!");
+
+      Serial.println(filename);
+
+      Serial.printf(
+        "JPEG size: %u bytes\n",
+        (unsigned int)written
+      );
+
+      photoNumber++;
+
+    } else {
+
+      Serial.println("Photo write incomplete");
+
+    }
+
+  } else {
+
+    Serial.println("Cannot create photo file");
+
+  }
+
+  // Release camera buffer
+
+  esp_camera_fb_return(fb);
+
+  // Restore preview quality
+
+  sensor->set_quality(
+    sensor,
+    PREVIEW_QUALITY
+  );
+
+  // Return to low-resolution preview
+
+  sensor->set_framesize(
+    sensor,
+    FRAMESIZE_QQVGA
+  );
+
+  delay(200);
+
+  Serial.println("Returned to live preview");
+}
+
+// ==========================================
+// BUTTON HANDLING
+// ==========================================
+
+void checkButton() {
+
+  static bool lastReading = HIGH;
+  static bool buttonState = HIGH;
+
+  static uint32_t lastDebounceTime = 0;
+
+  bool reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastReading) {
+
+    lastDebounceTime = millis();
+
+    lastReading = reading;
+  }
+
+  if (millis() - lastDebounceTime > 40) {
+
+    if (reading != buttonState) {
+
+      buttonState = reading;
+
+      if (buttonState == LOW) {
+
+        takePhoto();
+
+      }
+    }
+  }
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Check PSRAM
+
+  if (!psramFound()) {
+
+    Serial.println("ERROR: PSRAM NOT FOUND");
+
+  } else {
+
+    Serial.printf(
+      "PSRAM: %u KB\n",
+      ESP.getPsramSize() / 1024
+    );
+  }
+
+  // OLED initialization
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  Wire.setClock(400000);
+
+  if (!display.begin(
+        SSD1306_SWITCHCAPVCC,
+        0x3C
+      )) {
+
+    Serial.println("OLED initialization failed");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  display.clearDisplay();
+  display.display();
+
+  // Boot animation
+
+  bootAnimation();
+
+  // Initialize camera
+
+  cameraReady = initCamera();
+
+  // Initialize SD card
+
+  sdReady = initSD();
+
+  // JPEG decoder configuration
+
+  TJpgDec.setJpgScale(1);
+
+  TJpgDec.setSwapBytes(false);
+
+  TJpgDec.setCallback(jpegRender);
+
+  Serial.println("==========================");
+  Serial.println("LUMINO CLICKS READY");
+  Serial.println("==========================");
+
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+
+void loop() {
+
+  checkButton();
+
+  updatePreview();
+
+}
